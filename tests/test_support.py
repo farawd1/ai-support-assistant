@@ -1,71 +1,92 @@
 import asyncio
 import json
+import sqlite3
 import pytest
 from fastapi.testclient import TestClient
 from app import main, providers
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(main, 'DB', str(tmp_path / 'test.db'))
-    monkeypatch.setattr(main, 'MODE', 'demo')
-    with TestClient(main.app) as c:
-        yield c
+def client(tmp_path,monkeypatch):
+    monkeypatch.setattr(main,'DB',str(tmp_path/'test.db'))
+    monkeypatch.setattr(main,'TOPIC_LOCK',asyncio.Lock())
+    async def idle(): await asyncio.Event().wait()
+    monkeypatch.setattr(main,'start_workers',idle)
+    with TestClient(main.app) as c: yield c
 
-def test_end_to_end_and_edit_metrics(client):
-    r = client.post('/api/tickets', json={'text': 'С карты дважды списали оплату за заказ'})
-    assert r.status_code == 200
-    t = r.json()
-    assert t['state'] == 'ready'
-    assert t['result']['priority'] == 'P1'
-    assert t['result']['draft']['citations']
-    assert client.post(f"/api/tickets/{t['id']}/action", json={'action':'accepted','reply':'Изменённый ответ'}).json()['action'] == 'edited'
-    metrics = client.get('/api/analytics').json()
-    assert metrics['reviewed'] == 1 and metrics['acceptance_rate'] == 0
-    client.post(f"/api/tickets/{t['id']}/action", json={'action':'accepted','reply':t['result']['draft']['reply']})
-    assert client.get('/api/analytics').json()['reviewed'] == 1
+@pytest.fixture
+def live_mock(monkeypatch):
+    async def risks(text):
+        return providers.Risks(security=.1,money=.9,blocked=.1),{'model':'test-risk','usage':{}}
+    async def case(text,topics,risks):
+        return providers.CaseAnalysis(topic_id=topics[0]['id'] if topics else None,new_topic=None if topics else providers.TopicProposal(title='Двойное списание',description='Повторное списание за одну покупку'),evidence_quote=text,reasoning='Клиент сообщает о повторном списании',status='clarify',reply='Уточните дату и сумму платежа.',operator_note='Проверить платёж.'),{'model':'test-draft','usage':{}}
+    monkeypatch.setattr(providers,'assess_risks',risks)
+    monkeypatch.setattr(providers,'analyze_case',case)
 
-def test_unknown_and_security(client):
-    unknown = client.post('/api/tickets', json={'text':'Телепортация в соседнюю галактику'}).json()
-    assert unknown['result']['draft']['status'] == 'clarify'
-    security = client.post('/api/tickets', json={'text':'Мой аккаунт взломали'}).json()
-    assert security['result']['priority'] == 'P0'
-    assert security['result']['draft']['status'] == 'escalate'
+def ready(client):
+    r=client.post('/api/tickets',json={'text':'Списали дважды'})
+    assert r.status_code==202 and r.json()['state']=='queued'
+    return asyncio.run(main.analyze(r.json()['id']))
 
-def test_new_knowledge_is_searchable(client):
-    r = client.post('/api/documents', json={'title':'Промокод ORBIT42','topic':'information','body':'Промокод ORBIT42 действует только на первый заказ.'})
-    assert r.status_code == 200
-    t = client.post('/api/tickets', json={'text':'Какие условия промокода ORBIT42?'}).json()
-    assert r.json()['id'] in [d['id'] for d in t['result']['documents']]
+def test_real_queue_topic_and_decision(client,live_mock):
+    t=ready(client)
+    assert t['state']=='ready' and t['result']['analysis_mode']=='live'
+    assert t['result']['priority']=='P1'
+    assert len(client.get('/api/topics').json())==1
+    a=client.get('/api/analytics').json()
+    assert a['reviewed']==0 and a['ready']==1
+    client.post(f"/api/tickets/{t['id']}/action",json={'action':'accepted','reply':'Изменённый ответ'})
+    a=client.get('/api/analytics').json()
+    assert a['outcomes']['edited']==1 and a['reviewed']==1
+    assert sum(v['total'] for v in a['timeline'].values())==1
+    assert sum(v['reviewed'] for v in a['timeline'].values())==1
 
-def test_citation_rejection():
-    d = providers.Draft(status='draft', reply='Ответ', citations=[{'document_id':1,'quote':'выдумка'}], operator_note='')
-    with pytest.raises(ValueError):
-        providers.validate_citations(d, [{'id':1,'body':'настоящая цитата'}])
-    d.citations = []
-    with pytest.raises(ValueError):
-        providers.validate_citations(d, [])
+def test_reuses_discovered_topic(client,live_mock):
+    ready(client); ready(client)
+    topics=client.get('/api/topics').json()
+    assert len(topics)==1 and topics[0]['count']==2
 
-def test_live_contracts(monkeypatch):
-    calls = []
-    monkeypatch.setenv('TYPESAFE_API_KEY','test')
-    monkeypatch.setenv('DEEPSEEK_API_KEY','test')
-    async def fake(url, key, body):
-        calls.append(body)
-        if 'typesafe' in url:
-            return {'model':'jev-1.13.0','answers':{'topic':{'choice':'payment','confidence':.9},'security':{'noul':.1},'money':{'noul':.9},'blocked':{'noul':.1}}}
-        return {'model':'deepseek-flash','choices':[{'message':{'content':json.dumps({'status':'draft','reply':'Ответ','citations':[{'document_id':1,'quote':'Проверьте оплату'}],'operator_note':''})}}]}
-    monkeypatch.setattr(providers,'post',fake)
-    c, _ = asyncio.run(providers.classify('оплата', 'live'))
-    assert providers.priority(c)[0] == 'P1'
-    d, _ = asyncio.run(providers.generate('оплата',[{'id':1,'body':'Проверьте оплату'}],'live','P1'))
-    assert d.citations[0].document_id == 1
-    assert calls[0]['questions']['topic']['type'] == 'choice'
-    assert calls[1]['response_format']['type'] == 'json_object'
+def test_no_fake_fallback(client,monkeypatch):
+    async def fail(text): raise providers.ProviderError('Jev',402)
+    monkeypatch.setattr(providers,'assess_risks',fail)
+    t=ready(client)
+    assert t['state']=='failed' and t['result'] is None
+    assert '402' in t['error']
+    assert client.get('/api/topics').json()==[]
+    assert client.get('/api/analytics').json()['failed']==1
 
-def test_failure_visible(client, monkeypatch):
-    async def fail(*args):
-        raise RuntimeError('secret must not leak')
-    monkeypatch.setattr(main,'classify',fail)
-    t = client.post('/api/tickets',json={'text':'Проблема с оплатой'}).json()
-    assert t['state'] == 'failed' and 'secret' not in t['error']
-    assert client.get('/api/analytics').json()['failed'] == 1
+def test_retry_is_queued_and_duplicate_rejected(client,live_mock):
+    t=ready(client)
+    assert client.post(f"/api/tickets/{t['id']}/analyze").status_code==202
+    assert client.post(f"/api/tickets/{t['id']}/analyze").status_code==409
+    assert client.post(f"/api/tickets/{t['id']}/action",json={'action':'escalated'}).status_code==409
+
+def test_synthetic_input_real_analysis_latency(client,live_mock):
+    t=ready(client)
+    with main.db() as c:
+        c.execute("UPDATE tickets SET source='synthetic',received_at=NULL,latency=2.5 WHERE id=?",(t['id'],))
+    a=client.get('/api/analytics').json()
+    assert a['synthetic']==1 and a['average_latency']==2.5
+    assert a['reviewed']==0
+
+def test_migration_removes_simulated_history(client):
+    with main.db() as c:
+        c.execute("DELETE FROM settings WHERE key='live-v2'")
+        c.execute("INSERT INTO tickets(id,text,created,state,result,action,final_reply) VALUES('sim-123','Пример',100,'ready','{}','accepted','Муляж')")
+        c.execute("INSERT INTO actions(ticket_id,action,reply,created) VALUES('sim-123','accepted','Муляж',100)")
+    main.init_db()
+    t=main.get_ticket('sim-123')
+    assert t['state']=='queued' and t['received_at'] is None and t['action'] is None and t['result'] is None
+    with main.db() as c: assert c.execute('SELECT count(*) FROM actions').fetchone()[0]==0
+
+def test_ai_evidence_validation(monkeypatch):
+    async def fake(*args,**kwargs):
+        return dict(topic_id=None,new_topic={'title':'Новая тема','description':'Новое обращение о платеже'},evidence_quote='Выдуманная цитата',reasoning='Тема платежа',status='clarify',reply='Уточните детали',operator_note=''),{}
+    monkeypatch.setattr(providers,'deepseek',fake)
+    with pytest.raises(providers.ProviderError):
+        asyncio.run(providers.analyze_case('Оплата',[],providers.Risks(security=0,money=0,blocked=0)))
+
+def test_discovery_rejects_unknown_evidence(monkeypatch):
+    async def fake(*args,**kwargs):
+        return {'topics':[{'title':'Ошибка оплаты','description':'Невозможность оплатить','evidence_ids':['invented']}]},{}
+    monkeypatch.setattr(providers,'deepseek',fake)
+    with pytest.raises(providers.ProviderError): asyncio.run(providers.discover_topics([{'id':'real','text':'Не могу оплатить'}]))
