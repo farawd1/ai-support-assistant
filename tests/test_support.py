@@ -11,7 +11,11 @@ def client(tmp_path,monkeypatch):
     monkeypatch.setattr(main,'TOPIC_LOCK',asyncio.Lock())
     async def idle(): await asyncio.Event().wait()
     monkeypatch.setattr(main,'start_workers',idle)
-    with TestClient(main.app) as c: yield c
+    with TestClient(main.app) as c:
+        main.create_account('operator','operator-test-password','operator')
+        main.create_account('customer','customer-test-password','user')
+        assert c.post('/api/auth/login',json={'username':'operator','password':'operator-test-password'}).status_code==200
+        yield c
 
 @pytest.fixture
 def live_mock(monkeypatch):
@@ -23,7 +27,9 @@ def live_mock(monkeypatch):
     monkeypatch.setattr(providers,'analyze_case',case)
 
 def ready(client):
+    client.post('/api/auth/login',json={'username':'customer','password':'customer-test-password'})
     r=client.post('/api/tickets',json={'text':'Списали дважды'})
+    client.post('/api/auth/login',json={'username':'operator','password':'operator-test-password'})
     assert r.status_code==202 and r.json()['state']=='queued'
     return asyncio.run(main.analyze(r.json()['id']))
 
@@ -162,3 +168,52 @@ def test_auto_uncertain_abstains(client,live_mock,monkeypatch):
     assert r['action'] is None and r['auto_decision']['effective_action']=='manual'
     assert not asyncio.run(main.auto_step())
 
+
+def test_roles_and_sessions(client):
+    assert client.post('/api/tickets',json={'text':'Запрос оператора'}).status_code==403
+    client.post('/api/auth/logout')
+    assert client.get('/api/tickets').status_code==401
+    assert client.post('/api/tickets',json={'text':'Запрос гостя'}).status_code==401
+    assert client.post('/api/auth/login',json={'username':'customer','password':'wrong'}).status_code==401
+    login=client.post('/api/auth/login',json={'username':'customer','password':'customer-test-password'})
+    assert login.json()['role']=='user'
+    assert 'httponly' in login.headers['set-cookie'].lower()
+    for path in ['/api/tickets','/api/analytics','/api/topics','/api/config','/api/autopilot','/api/audit']:
+        assert client.get(path).status_code==403
+    assert client.post('/api/autopilot',json={'enabled':True}).status_code==403
+    assert client.post('/api/batch/retry').status_code==403
+    r=client.post('/api/tickets',json={'text':'Мой вопрос'})
+    assert r.status_code==202 and set(r.json())=={'id','state'}
+    id=r.json()['id']
+    assert client.get('/api/tickets/'+id).status_code==403
+    assert client.post('/api/tickets/'+id+'/analyze').status_code==403
+    assert client.post('/api/tickets/'+id+'/action',json={'action':'rejected'}).status_code==403
+    with main.db() as c:
+        row=c.execute('SELECT owner_id FROM tickets WHERE id=?',(id,)).fetchone()
+        assert row['owner_id'] is not None
+    client.post('/api/auth/logout')
+    assert client.get('/api/auth/me').status_code==401
+
+
+def test_audit_interval_and_pagination(client):
+    with main.db() as c:
+        for stamp in [100,200,300]:
+            c.execute("INSERT INTO audit(created,actor,event,target) VALUES(?,'operator','test','ticket')",(stamp,))
+    params={'start':'1970-01-01T00:01:40Z','end':'1970-01-01T00:05:00Z','limit':1}
+    r=client.get('/api/audit',params=params)
+    assert r.status_code==200 and r.json()['total']==2
+    assert r.json()['events'][0]['created']==200
+    assert client.get('/api/audit',params={**params,'offset':1}).json()['events'][0]['created']==100
+    assert client.get('/api/audit',params={**params,'end':params['start']}).status_code==422
+    assert client.get('/api/audit',params={**params,'start':'1970-01-01T00:01:40'}).status_code==422
+    assert client.get('/api/audit',params={**params,'limit':501}).status_code==422
+
+
+def test_cross_origin_and_password_storage(client):
+    assert client.post('/api/auth/logout',headers={'Origin':'https://attacker.example'}).status_code==403
+    assert client.get('/api/auth/me').status_code==200
+    with main.db() as c:
+        hashed=c.execute("SELECT password_hash FROM accounts WHERE username='operator'").fetchone()[0]
+        assert 'operator-test-password' not in hashed
+        assert main.verify_password('operator-test-password',hashed)
+        assert not main.verify_password('wrong',hashed)
