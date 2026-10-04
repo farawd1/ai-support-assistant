@@ -21,13 +21,20 @@ from typing import Literal
 from . import providers
 
 ROOT=Path(__file__).resolve().parent.parent
+load_dotenv(ROOT/'.env.local')
 load_dotenv(ROOT/'.env')
 DB=os.getenv('DATABASE_PATH',str(ROOT/'data/support.db'))
 if not Path(DB).is_absolute(): DB=str(ROOT/DB)
+DATABASE_URL=os.getenv('DATABASE_URL','')
+SERVERLESS=os.getenv('VERCEL')=='1'
 TOPIC_LOCK=asyncio.Lock()
 
 @contextmanager
 def db():
+    if DATABASE_URL:
+        from .postgres import connect
+        with connect(DATABASE_URL) as conn: yield conn
+        return
     conn=sqlite3.connect(DB,timeout=20)
     conn.row_factory=sqlite3.Row
     try:
@@ -40,6 +47,12 @@ def db():
         conn.close()
 
 def init_db():
+    if SERVERLESS and not DATABASE_URL:
+        raise RuntimeError('Vercel requires DATABASE_URL for persistent storage')
+    if DATABASE_URL:
+        from .postgres import initialize
+        initialize(DATABASE_URL)
+        return
     Path(DB).parent.mkdir(parents=True,exist_ok=True)
     with db() as c:
         c.executescript('''
@@ -54,7 +67,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         ''')
         columns={r['name'] for r in c.execute('PRAGMA table_info(tickets)')}
-        for name,kind in [('source',"TEXT NOT NULL DEFAULT 'manual'"),('received_at','REAL'),('analyzed_at','REAL'),('topic_id','INTEGER'),('reviewed_at','REAL'),('decision_actor','TEXT'),('auto_state',"TEXT NOT NULL DEFAULT 'pending'"),('auto_decision','TEXT')]:
+        for name,kind in [('source',"TEXT NOT NULL DEFAULT 'manual'"),('received_at','REAL'),('analyzed_at','REAL'),('topic_id','INTEGER'),('reviewed_at','REAL'),('decision_actor','TEXT'),('auto_state',"TEXT NOT NULL DEFAULT 'pending'"),('auto_decision','TEXT'),('processing_started','REAL'),('processing_token','TEXT'),('auto_started','REAL')]:
             if name not in columns: c.execute(f'ALTER TABLE tickets ADD COLUMN {name} {kind}')
         if 'owner_id' not in columns: c.execute('ALTER TABLE tickets ADD COLUMN owner_id INTEGER')
         action_columns={r['name'] for r in c.execute('PRAGMA table_info(actions)')}
@@ -114,7 +127,7 @@ async def auto_step():
         if not settings['enabled']: return False
         row=c.execute("SELECT * FROM tickets WHERE state='ready' AND action IS NULL AND auto_state='pending' ORDER BY created LIMIT 1").fetchone()
         if row is None: return False
-        c.execute("UPDATE tickets SET auto_state='processing' WHERE id=?",(row['id'],))
+        c.execute("UPDATE tickets SET auto_state='processing',auto_started=? WHERE id=?",(time.time(),row['id']))
     result=json.loads(row['result'])
     try:
         decision,meta=await providers.evaluate_decision(row['text'],result)
@@ -156,10 +169,10 @@ async def auto_step():
 
 def save_topic(c,title,description,model,evidence_ids):
     normalized=normalize(title)
-    c.execute('INSERT OR IGNORE INTO topics(title,normalized,description,created,model,evidence_ids) VALUES(?,?,?,?,?,?)',(title.strip(),normalized,description,time.time(),model,json.dumps(evidence_ids)))
+    c.execute('INSERT INTO topics(title,normalized,description,created,model,evidence_ids) VALUES(?,?,?,?,?,?) ON CONFLICT(normalized) DO NOTHING',(title.strip(),normalized,description,time.time(),model,json.dumps(evidence_ids)))
     return c.execute('SELECT id FROM topics WHERE normalized=?',(normalized,)).fetchone()['id']
 
-async def analyze(ticket_id):
+async def analyze(ticket_id,processing_token=None):
     t=get_ticket(ticket_id)
     start=time.perf_counter()
     try:
@@ -172,6 +185,10 @@ async def analyze(ticket_id):
                 result,deepseek=await providers.analyze_case(t['text'],catalog(),risks)
             p,reasons=providers.priority(risks)
             with db() as c:
+                c.execute('BEGIN IMMEDIATE')
+                if processing_token:
+                    current=c.execute('SELECT processing_token FROM tickets WHERE id=?',(ticket_id,)).fetchone()
+                    if current is None or current['processing_token']!=processing_token: return get_ticket(ticket_id)
                 topic_id=result.topic_id
                 if topic_id is None:
                     topic_id=save_topic(c,result.new_topic.title,result.new_topic.description,deepseek['model'],[ticket_id])
@@ -184,7 +201,7 @@ async def analyze(ticket_id):
             labels={'401':'Ключ не принят','402':'Недостаточно средств','403':'Доступ запрещён','429':'Лимит запросов','network':'Сеть или таймаут'}
             message=f'{error.provider}: {labels.get(error.code,"ошибка ответа")} ({error.code})'
         with db() as c:
-            c.execute("UPDATE tickets SET state='failed',error=?,latency=?,analyzed_at=? WHERE id=?",(message,time.perf_counter()-start,time.time(),ticket_id))
+            c.execute("UPDATE tickets SET state='failed',error=?,latency=?,analyzed_at=? WHERE id=?"+(" AND processing_token=?" if processing_token else ''),(message,time.perf_counter()-start,time.time(),ticket_id)+((processing_token,) if processing_token else ()))
     return get_ticket(ticket_id)
 
 async def bootstrap_topics():
@@ -197,11 +214,11 @@ async def bootstrap_topics():
         with db() as c:
             for topic in discovered.topics:
                 save_topic(c,topic.title,topic.description,meta['model'],topic.evidence_ids)
-            c.execute("INSERT OR REPLACE INTO settings VALUES('discovery',?)",(json.dumps({'at':time.time(),**meta}),))
+            c.execute("INSERT INTO settings VALUES('discovery',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps({'at':time.time(),**meta}),))
     except Exception as error:
         message=f'{error.provider}: {error.code}' if isinstance(error,providers.ProviderError) else 'Некорректный ответ при выделении тем'
         with db() as c:
-            c.execute("INSERT OR REPLACE INTO settings VALUES('discovery_error',?)",(message,))
+            c.execute("INSERT INTO settings VALUES('discovery_error',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(message,))
         # Individual analysis can still propose topics. No synthetic fallback.
 
 async def worker():
@@ -223,6 +240,11 @@ async def start_workers():
 @asynccontextmanager
 async def lifespan(app):
     init_db()
+    bootstrap_accounts()
+    if SERVERLESS:
+        # Queue subscribers run independently; never reset work owned by other instances.
+        yield
+        return
     with db() as c:
         c.execute("UPDATE tickets SET state='queued' WHERE state='processing'")
         c.execute("UPDATE tickets SET auto_state='pending' WHERE auto_state='processing'")
@@ -249,6 +271,30 @@ def create_account(username,password,role):
         raise ValueError('Имя 3–80 символов, пароль от 12 символов, роль user/operator')
     with db() as c:
         c.execute('INSERT INTO accounts(username,password_hash,role) VALUES(?,?,?)',(username.strip().lower(),password_hash(password),role))
+
+def bootstrap_accounts():
+    for prefix,role in [('OPERATOR','operator'),('USER','user')]:
+        name=os.getenv('BOOTSTRAP_'+prefix+'_USERNAME','').strip().lower()
+        password=os.getenv('BOOTSTRAP_'+prefix+'_PASSWORD','')
+        if not name or not password: continue
+        if not 3<=len(name)<=80 or len(password)<12:
+            raise RuntimeError('Invalid bootstrap account configuration')
+        with db() as c: exists=c.execute('SELECT 1 FROM accounts WHERE username=?',(name,)).fetchone()
+        if not exists:
+            hashed=password_hash(password)
+            with db() as c:
+                c.execute('INSERT INTO accounts(username,password_hash,role) VALUES(?,?,?) ON CONFLICT(username) DO NOTHING',(name,hashed,role))
+
+async def enqueue_work(kind,ticket_id=None):
+    if not SERVERLESS: return
+    from vercel.queue import send
+    payload={'kind':kind}
+    if ticket_id: payload['ticket_id']=ticket_id
+    try:
+        await send('repl-support',payload)
+    except Exception:
+        # Input stays durable in Postgres and can be retried by the operator.
+        raise HTTPException(503,'Очередь временно недоступна. Запрос сохранён; оператор сможет повторить обработку.') from None
 
 def audit_event(actor,event,target,detail=''):
     with db() as c: c.execute('INSERT INTO audit(created,actor,event,target,detail) VALUES(?,?,?,?,?)',(time.time(),actor,event,target,detail))
@@ -305,7 +351,7 @@ async def login(payload:LoginInput,response:Response):
         with db() as c:
             c.execute('DELETE FROM sessions WHERE expires<?',(now,))
             c.execute('INSERT INTO sessions VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),account['id'],now+43200))
-        response.set_cookie('repl_session',token,httponly=True,samesite='strict',secure=os.getenv('COOKIE_SECURE','false').lower()=='true',max_age=43200,path='/')
+        response.set_cookie('repl_session',token,httponly=True,samesite='strict',secure=SERVERLESS or os.getenv('COOKIE_SECURE','false').lower()=='true',max_age=43200,path='/')
         audit_event(name,'login','auth')
         return {'username':name,'role':account['role']}
 
@@ -333,7 +379,7 @@ app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 @app.get('/')
 def home(): return FileResponse(ROOT/'static/index.html')
 @app.get('/api/config')
-def config(): return {'mode':'live','topics':{str(t['id']):t['title'] for t in catalog()}}
+def config(): return {'mode':'live','serverless':SERVERLESS,'topics':{str(t['id']):t['title'] for t in catalog()}}
 
 @app.get('/api/autopilot')
 def autopilot():
@@ -344,29 +390,32 @@ class AutopilotInput(BaseModel):
     enabled: bool
 
 @app.post('/api/autopilot')
-def set_autopilot(payload:AutopilotInput):
+async def set_autopilot(payload:AutopilotInput):
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
         c.execute("UPDATE settings SET value=? WHERE key='autopilot'",('on' if payload.enabled else 'off',))
-        c.execute("UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='autopilot_revision'")
+        c.execute("UPDATE settings SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='autopilot_revision'")
+    if payload.enabled: await enqueue_work('autopilot')
     return autopilot()
 
 @app.post('/api/autopilot/retry')
-def retry_autopilot():
+async def retry_autopilot():
     with db() as c:
         count=c.execute("UPDATE tickets SET auto_state='pending',auto_decision=NULL WHERE auto_state='failed' AND action IS NULL").rowcount
+    if count: await enqueue_work('autopilot')
     return {'queued':count}
 
 class TicketInput(BaseModel):
     text: str=Field(min_length=3,max_length=12000)
 @app.post('/api/tickets',status_code=202)
-def create_ticket(payload:TicketInput,request:Request):
+async def create_ticket(payload:TicketInput,request:Request):
     if len(payload.text.strip())<3: raise HTTPException(422,'Введите сообщение')
     ticket_id=uuid4().hex[:12]
     now=time.time()
     with db() as c:
         c.execute("INSERT INTO tickets(id,text,created,received_at,state,source,owner_id) VALUES(?,?,?,?,'queued','manual',?)",(ticket_id,payload.text.strip(),now,now,request.state.account['id']))
         c.execute('INSERT INTO audit(created,actor,event,target) VALUES(?,?,?,?)',(now,request.state.account['username'],'ticket_created',ticket_id))
+    await enqueue_work('analyze',ticket_id)
     return {'id':ticket_id,'state':'queued'}
 @app.get('/api/tickets')
 def list_tickets():
@@ -375,17 +424,20 @@ def list_tickets():
 @app.get('/api/tickets/{ticket_id}')
 def detail(ticket_id:str): return get_ticket(ticket_id)
 @app.post('/api/tickets/{ticket_id}/analyze',status_code=202)
-def retry(ticket_id:str):
+async def retry(ticket_id:str):
     get_ticket(ticket_id)
     with db() as c:
         changed=c.execute("UPDATE tickets SET state='queued',result=NULL,error=NULL,action=NULL,final_reply=NULL,analyzed_at=NULL,reviewed_at=NULL,topic_id=NULL,latency=NULL,decision_actor=NULL,auto_state='pending',auto_decision=NULL WHERE id=? AND state NOT IN ('processing','queued')",(ticket_id,)).rowcount
     if not changed: raise HTTPException(409,'Анализ уже в очереди')
+    await enqueue_work('analyze',ticket_id)
     return get_ticket(ticket_id)
 @app.post('/api/batch/retry',status_code=202)
-def retry_failed():
+async def retry_failed():
     with db() as c:
-        changed=c.execute("UPDATE tickets SET state='queued',error=NULL,analyzed_at=NULL,latency=NULL WHERE state='failed'").rowcount
-    return {'queued':changed}
+        ids=[r['id'] for r in c.execute("SELECT id FROM tickets WHERE state IN ('failed','queued') OR (state='processing' AND COALESCE(processing_started,0)<?)",(time.time()-360,))]
+        c.execute("UPDATE tickets SET state='queued',error=NULL,analyzed_at=NULL,latency=NULL,processing_token=NULL WHERE state='failed' OR (state='processing' AND COALESCE(processing_started,0)<?)",(time.time()-360,))
+    for ticket_id in ids: await enqueue_work('analyze',ticket_id)
+    return {'queued':len(ids)}
 
 class ActionInput(BaseModel):
     action: Literal['accepted','edited','rejected','escalated']
