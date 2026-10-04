@@ -7,3 +7,5 @@
 __pycache__/
 .pytest_cache/
 data/*.db*
+local-accounts.txt
+repl-*-preview.png
