@@ -7,6 +7,8 @@ from app import main, providers
 
 @pytest.fixture
 def client(tmp_path,monkeypatch):
+    monkeypatch.setattr(main,'DATABASE_URL','')
+    monkeypatch.setattr(main,'SERVERLESS',False)
     monkeypatch.setattr(main,'DB',str(tmp_path/'test.db'))
     monkeypatch.setattr(main,'TOPIC_LOCK',asyncio.Lock())
     async def idle(): await asyncio.Event().wait()
@@ -137,7 +139,7 @@ def test_auto_risk_forces_human(client,live_mock,agent_mock):
 def test_auto_disabled_during_request(client,live_mock,monkeypatch):
     t=low_risk_ticket(client,live_mock)
     async def evaluate(text,result):
-        main.set_autopilot(main.AutopilotInput(enabled=False))
+        await main.set_autopilot(main.AutopilotInput(enabled=False))
         return providers.AgentDecision(action='clarify',confidence=.99,reason='Можно уточнить сообщение',requires_external_action=False),{}
     monkeypatch.setattr(providers,'evaluate_decision',evaluate)
     client.post('/api/autopilot',json={'enabled':True})
@@ -217,3 +219,43 @@ def test_cross_origin_and_password_storage(client):
         assert 'operator-test-password' not in hashed
         assert main.verify_password('operator-test-password',hashed)
         assert not main.verify_password('wrong',hashed)
+
+def test_serverless_requires_persistent_database(monkeypatch):
+    monkeypatch.setattr(main,'SERVERLESS',True)
+    monkeypatch.setattr(main,'DATABASE_URL','')
+    with pytest.raises(RuntimeError,match='DATABASE_URL'): main.init_db()
+
+
+def test_queue_delivery_is_idempotent(client,live_mock,monkeypatch):
+    import queue_tasks
+    client.post('/api/auth/login',json={'username':'customer','password':'customer-test-password'})
+    t=client.post('/api/tickets',json={'text':'Списали дважды'}).json()
+    async def no_enqueue(*args): pass
+    monkeypatch.setattr(main,'enqueue_work',no_enqueue)
+    asyncio.run(queue_tasks.support_task({'kind':'analyze','ticket_id':t['id']}))
+    first=main.get_ticket(t['id'])
+    assert first['state']=='ready'
+    asyncio.run(queue_tasks.support_task({'kind':'analyze','ticket_id':t['id']}))
+    assert main.get_ticket(t['id'])['analyzed_at']==first['analyzed_at']
+
+
+def test_queue_preserves_active_lease_and_recovers_stale(client,live_mock,monkeypatch):
+    import queue_tasks,time
+    client.post('/api/auth/login',json={'username':'customer','password':'customer-test-password'})
+    t=client.post('/api/tickets',json={'text':'Списали дважды'}).json()
+    async def no_enqueue(*args): pass
+    monkeypatch.setattr(main,'enqueue_work',no_enqueue)
+    with main.db() as c: c.execute("UPDATE tickets SET state='processing',processing_started=?,processing_token='old' WHERE id=?",(time.time(),t['id']))
+    with pytest.raises(RuntimeError,match='lease'): asyncio.run(queue_tasks.support_task({'kind':'analyze','ticket_id':t['id']}))
+    with main.db() as c: c.execute('UPDATE tickets SET processing_started=0 WHERE id=?',(t['id'],))
+    asyncio.run(queue_tasks.support_task({'kind':'analyze','ticket_id':t['id']}))
+    assert main.get_ticket(t['id'])['state']=='ready'
+
+
+def test_stale_analysis_cannot_overwrite_new_attempt(client,live_mock):
+    client.post('/api/auth/login',json={'username':'customer','password':'customer-test-password'})
+    t=client.post('/api/tickets',json={'text':'Списали дважды'}).json()
+    with main.db() as c: c.execute("UPDATE tickets SET processing_token='current' WHERE id=?",(t['id'],))
+    asyncio.run(main.analyze(t['id'],processing_token='stale'))
+    assert main.get_ticket(t['id'])['state']=='queued'
+    assert main.catalog()==[]
