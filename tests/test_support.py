@@ -90,3 +90,75 @@ def test_discovery_rejects_unknown_evidence(monkeypatch):
         return {'topics':[{'title':'Ошибка оплаты','description':'Невозможность оплатить','evidence_ids':['invented']}]},{}
     monkeypatch.setattr(providers,'deepseek',fake)
     with pytest.raises(providers.ProviderError): asyncio.run(providers.discover_topics([{'id':'real','text':'Не могу оплатить'}]))
+
+@pytest.fixture
+def agent_mock(monkeypatch):
+    async def evaluate(text,result):
+        return providers.AgentDecision(action='clarify',confidence=.97,reason='Нужны дата и сумма для проверки',requires_external_action=False),{'model':'test-review'}
+    monkeypatch.setattr(providers,'evaluate_decision',evaluate)
+
+def low_risk_ticket(client,live_mock):
+    t=ready(client)
+    with main.db() as c:
+        r=t['result'];r['priority']='P2'
+        c.execute('UPDATE tickets SET result=? WHERE id=?',(json.dumps(r),t['id']))
+    return t
+
+def test_auto_off_has_no_effect(client,live_mock,agent_mock):
+    t=ready(client)
+    assert not asyncio.run(main.auto_step())
+    assert main.get_ticket(t['id'])['action'] is None
+
+def test_auto_clarification_not_closed_or_human_review(client,live_mock,agent_mock):
+    t=low_risk_ticket(client,live_mock)
+    client.post('/api/autopilot',json={'enabled':True})
+    assert asyncio.run(main.auto_step())
+    r=main.get_ticket(t['id'])
+    assert r['action']=='clarified' and r['decision_actor']=='agent'
+    a=main.analytics()
+    assert a['open']==1 and a['reviewed']==0 and a['auto_clarified']==1
+    assert not asyncio.run(main.auto_step())
+    assert len(r['history'])==1
+
+def test_auto_risk_forces_human(client,live_mock,agent_mock):
+    t=ready(client)
+    client.post('/api/autopilot',json={'enabled':True})
+    asyncio.run(main.auto_step())
+    r=main.get_ticket(t['id'])
+    assert r['action']=='escalated' and r['final_reply']==''
+    assert main.analytics()['open']==1
+
+def test_auto_disabled_during_request(client,live_mock,monkeypatch):
+    t=low_risk_ticket(client,live_mock)
+    async def evaluate(text,result):
+        main.set_autopilot(main.AutopilotInput(enabled=False))
+        return providers.AgentDecision(action='clarify',confidence=.99,reason='Можно уточнить сообщение',requires_external_action=False),{}
+    monkeypatch.setattr(providers,'evaluate_decision',evaluate)
+    client.post('/api/autopilot',json={'enabled':True})
+    asyncio.run(main.auto_step())
+    assert main.get_ticket(t['id'])['action'] is None
+    assert main.get_ticket(t['id'])['auto_state']=='pending'
+
+def test_human_wins_race(client,live_mock,monkeypatch):
+    t=low_risk_ticket(client,live_mock)
+    async def evaluate(text,result):
+        main.action(t['id'],main.ActionInput(action='accepted',reply='Ответ оператора'))
+        return providers.AgentDecision(action='clarify',confidence=.99,reason='Можно уточнить сообщение',requires_external_action=False),{}
+    monkeypatch.setattr(providers,'evaluate_decision',evaluate)
+    client.post('/api/autopilot',json={'enabled':True})
+    asyncio.run(main.auto_step())
+    r=main.get_ticket(t['id'])
+    assert r['decision_actor']=='human' and r['final_reply']=='Ответ оператора'
+    assert len(r['history'])==1
+
+def test_auto_uncertain_abstains(client,live_mock,monkeypatch):
+    t=low_risk_ticket(client,live_mock)
+    async def evaluate(text,result):
+        return providers.AgentDecision(action='clarify',confidence=.5,reason='Недостаточно уверенности для ответа',requires_external_action=False),{}
+    monkeypatch.setattr(providers,'evaluate_decision',evaluate)
+    client.post('/api/autopilot',json={'enabled':True})
+    asyncio.run(main.auto_step())
+    r=main.get_ticket(t['id'])
+    assert r['action'] is None and r['auto_decision']['effective_action']=='manual'
+    assert not asyncio.run(main.auto_step())
+
