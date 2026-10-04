@@ -1,4 +1,7 @@
 import asyncio
+import hashlib
+import hmac
+import secrets
 import json
 import os
 import sqlite3
@@ -10,8 +13,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, Response, Query
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Literal
@@ -41,6 +44,10 @@ def init_db():
     with db() as c:
         c.executescript('''
         PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('user','operator')));
+        CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,account_id INTEGER NOT NULL,expires REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,created REAL NOT NULL,actor TEXT NOT NULL,event TEXT NOT NULL,target TEXT NOT NULL,detail TEXT NOT NULL DEFAULT '');
+        CREATE INDEX IF NOT EXISTS audit_time ON audit(created,id);
         CREATE TABLE IF NOT EXISTS tickets(id TEXT PRIMARY KEY,text TEXT NOT NULL,created REAL NOT NULL,state TEXT NOT NULL,result TEXT,error TEXT,action TEXT,final_reply TEXT,latency REAL);
         CREATE TABLE IF NOT EXISTS actions(id INTEGER PRIMARY KEY,ticket_id TEXT NOT NULL,action TEXT NOT NULL,reply TEXT NOT NULL,created REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS topics(id INTEGER PRIMARY KEY,title TEXT NOT NULL,normalized TEXT UNIQUE NOT NULL,description TEXT NOT NULL,created REAL NOT NULL,model TEXT NOT NULL,evidence_ids TEXT NOT NULL);
@@ -49,9 +56,19 @@ def init_db():
         columns={r['name'] for r in c.execute('PRAGMA table_info(tickets)')}
         for name,kind in [('source',"TEXT NOT NULL DEFAULT 'manual'"),('received_at','REAL'),('analyzed_at','REAL'),('topic_id','INTEGER'),('reviewed_at','REAL'),('decision_actor','TEXT'),('auto_state',"TEXT NOT NULL DEFAULT 'pending'"),('auto_decision','TEXT')]:
             if name not in columns: c.execute(f'ALTER TABLE tickets ADD COLUMN {name} {kind}')
+        if 'owner_id' not in columns: c.execute('ALTER TABLE tickets ADD COLUMN owner_id INTEGER')
         action_columns={r['name'] for r in c.execute('PRAGMA table_info(actions)')}
         if 'actor' not in action_columns: c.execute("ALTER TABLE actions ADD COLUMN actor TEXT NOT NULL DEFAULT 'human'")
         if 'reason' not in action_columns: c.execute("ALTER TABLE actions ADD COLUMN reason TEXT NOT NULL DEFAULT ''")
+        c.executescript("""
+        CREATE TRIGGER IF NOT EXISTS audit_decisions AFTER INSERT ON actions BEGIN
+          INSERT INTO audit(created,actor,event,target,detail) VALUES(NEW.created,NEW.actor,'decision',NEW.ticket_id,NEW.action || ': ' || NEW.reason);
+        END;
+        CREATE TRIGGER IF NOT EXISTS audit_analysis AFTER UPDATE OF state ON tickets
+        WHEN NEW.state IN ('ready','failed') AND OLD.state != NEW.state BEGIN
+          INSERT INTO audit(created,actor,event,target,detail) VALUES(CAST(strftime('%s','now') AS REAL),'system','analysis',NEW.id,NEW.state);
+        END;
+        """)
         c.execute("INSERT OR IGNORE INTO settings VALUES('autopilot','off')")
         c.execute("INSERT OR IGNORE INTO settings VALUES('autopilot_revision','0')")
         if not c.execute("SELECT 1 FROM settings WHERE key='live-v2'").fetchone():
@@ -216,6 +233,102 @@ async def lifespan(app):
     except asyncio.CancelledError: pass
 
 app=FastAPI(title='Repl.io',lifespan=lifespan)
+
+def password_hash(password):
+    salt=secrets.token_hex(16)
+    digest=hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(salt),600000).hex()
+    return salt+':'+digest
+
+def verify_password(password,stored):
+    salt,digest=stored.split(':')
+    actual=hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(salt),600000).hex()
+    return hmac.compare_digest(actual,digest)
+
+def create_account(username,password,role):
+    if role not in ('user','operator') or len(password)<12 or not 3<=len(username.strip())<=80:
+        raise ValueError('Имя 3–80 символов, пароль от 12 символов, роль user/operator')
+    with db() as c:
+        c.execute('INSERT INTO accounts(username,password_hash,role) VALUES(?,?,?)',(username.strip().lower(),password_hash(password),role))
+
+def audit_event(actor,event,target,detail=''):
+    with db() as c: c.execute('INSERT INTO audit(created,actor,event,target,detail) VALUES(?,?,?,?,?)',(time.time(),actor,event,target,detail))
+
+@app.middleware('http')
+async def access_control(request:Request,call_next):
+    path=request.url.path
+    if not path.startswith('/api/'):
+        return await call_next(request)
+    if request.method not in ('GET','HEAD','OPTIONS'):
+        origin=request.headers.get('origin')
+        if origin and origin!=str(request.base_url).rstrip('/'):
+            return JSONResponse({'detail':'Недопустимый источник запроса'},status_code=403)
+    if path=='/api/auth/login': return await call_next(request)
+    token=request.cookies.get('repl_session','')
+    digest=hashlib.sha256(token.encode()).hexdigest()
+    with db() as c:
+        account=c.execute('SELECT a.id,a.username,a.role FROM accounts a JOIN sessions s ON s.account_id=a.id WHERE s.token_hash=? AND s.expires>?',(digest,time.time())).fetchone()
+    if account is None: return JSONResponse({'detail':'Войдите в аккаунт'},status_code=401)
+    request.state.account=dict(account)
+    auth_path=path in ('/api/auth/me','/api/auth/logout')
+    required='user' if path=='/api/tickets' and request.method=='POST' else 'operator'
+    if not auth_path and account['role']!=required:
+        return JSONResponse({'detail':'Недостаточно прав для этого действия'},status_code=403)
+    response=await call_next(request)
+    if request.method=='POST' and not auth_path and path!='/api/tickets' and response.status_code<400:
+        audit_event(account['username'],'command',path)
+    return response
+
+class LoginInput(BaseModel):
+    username:str=Field(min_length=3,max_length=80)
+    password:str=Field(min_length=1,max_length=256)
+
+# Per-account throttling within this server process.
+LOGIN_LOCK=asyncio.Lock()
+LOGIN_ATTEMPTS={}
+@app.post('/api/auth/login')
+async def login(payload:LoginInput,response:Response):
+    name=payload.username.strip().lower()
+    async with LOGIN_LOCK:
+        now=time.time()
+        attempts=[stamp for stamp in LOGIN_ATTEMPTS.get(name,[]) if stamp>now-300]
+        if len(attempts)>=5: raise HTTPException(429,'Слишком много попыток. Попробуйте через 5 минут')
+        with db() as c: account=c.execute('SELECT * FROM accounts WHERE username=?',(name,)).fetchone()
+        # Equal password work even for unknown accounts.
+        stored=account['password_hash'] if account else '00'*16+':'+'00'*32
+        valid=await asyncio.to_thread(verify_password,payload.password,stored)
+        if account is None or not valid:
+            LOGIN_ATTEMPTS[name]=attempts+[now]
+            audit_event(name,'login_failed','auth')
+            raise HTTPException(401,'Неверное имя или пароль')
+        LOGIN_ATTEMPTS.pop(name,None)
+        token=secrets.token_urlsafe(48)
+        with db() as c:
+            c.execute('DELETE FROM sessions WHERE expires<?',(now,))
+            c.execute('INSERT INTO sessions VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),account['id'],now+43200))
+        response.set_cookie('repl_session',token,httponly=True,samesite='strict',secure=os.getenv('COOKIE_SECURE','false').lower()=='true',max_age=43200,path='/')
+        audit_event(name,'login','auth')
+        return {'username':name,'role':account['role']}
+
+@app.get('/api/auth/me')
+def me(request:Request): return request.state.account
+
+@app.post('/api/auth/logout')
+def logout(request:Request,response:Response):
+    with db() as c: c.execute('DELETE FROM sessions WHERE token_hash=?',(hashlib.sha256(request.cookies.get('repl_session','').encode()).hexdigest(),))
+    response.delete_cookie('repl_session',path='/')
+    audit_event(request.state.account['username'],'logout','auth')
+    return {'ok':True}
+
+@app.get('/api/audit')
+def read_audit(start:datetime,end:datetime,limit:int=Query(100,ge=1,le=500),offset:int=Query(0,ge=0)):
+    if start.tzinfo is None or end.tzinfo is None or start>=end:
+        raise HTTPException(422,'Укажите корректный период с часовым поясом')
+    with db() as c:
+        params=(start.timestamp(),end.timestamp())
+        total=c.execute('SELECT COUNT(*) FROM audit WHERE created>=? AND created<?',params).fetchone()[0]
+        events=[dict(r) for r in c.execute('SELECT * FROM audit WHERE created>=? AND created<? ORDER BY created DESC,id DESC LIMIT ? OFFSET ?',params+(limit,offset))]
+    return {'events':events,'total':total,'offset':offset,'limit':limit}
+
 app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 @app.get('/')
 def home(): return FileResponse(ROOT/'static/index.html')
@@ -247,12 +360,14 @@ def retry_autopilot():
 class TicketInput(BaseModel):
     text: str=Field(min_length=3,max_length=12000)
 @app.post('/api/tickets',status_code=202)
-def create_ticket(payload:TicketInput):
+def create_ticket(payload:TicketInput,request:Request):
     if len(payload.text.strip())<3: raise HTTPException(422,'Введите сообщение')
     ticket_id=uuid4().hex[:12]
     now=time.time()
-    with db() as c: c.execute("INSERT INTO tickets(id,text,created,received_at,state,source) VALUES(?,?,?,?,'queued','manual')",(ticket_id,payload.text.strip(),now,now))
-    return get_ticket(ticket_id)
+    with db() as c:
+        c.execute("INSERT INTO tickets(id,text,created,received_at,state,source,owner_id) VALUES(?,?,?,?,'queued','manual',?)",(ticket_id,payload.text.strip(),now,now,request.state.account['id']))
+        c.execute('INSERT INTO audit(created,actor,event,target) VALUES(?,?,?,?)',(now,request.state.account['username'],'ticket_created',ticket_id))
+    return {'id':ticket_id,'state':'queued'}
 @app.get('/api/tickets')
 def list_tickets():
     with db() as c: ids=[r['id'] for r in c.execute('SELECT id FROM tickets ORDER BY created DESC,id LIMIT 1000')]
@@ -276,7 +391,7 @@ class ActionInput(BaseModel):
     action: Literal['accepted','edited','rejected','escalated']
     reply: str=Field(default='',max_length=10000)
 @app.post('/api/tickets/{ticket_id}/action')
-def action(ticket_id:str,payload:ActionInput):
+def action(ticket_id:str,payload:ActionInput,request:Request=None):
     with db() as c:
         row=c.execute('SELECT * FROM tickets WHERE id=?',(ticket_id,)).fetchone()
         if row is None: raise HTTPException(404,'Обращение не найдено')
@@ -286,7 +401,7 @@ def action(ticket_id:str,payload:ActionInput):
         actual='edited' if payload.action=='accepted' and reply!=json.loads(row['result'])['draft']['reply'] else payload.action
         now=time.time()
         c.execute("UPDATE tickets SET action=?,final_reply=?,reviewed_at=?,decision_actor='human',auto_state='done' WHERE id=?",(actual,reply,now,ticket_id))
-        c.execute('INSERT INTO actions(ticket_id,action,reply,created) VALUES(?,?,?,?)',(ticket_id,actual,reply,now))
+        c.execute('INSERT INTO actions(ticket_id,action,reply,created,actor) VALUES(?,?,?,?,?)',(ticket_id,actual,reply,now,request.state.account['username'] if request else 'human'))
     return get_ticket(ticket_id)
 
 @app.get('/api/topics')
