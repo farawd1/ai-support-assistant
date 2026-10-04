@@ -9,3 +9,10 @@ __pycache__/
 data/*.db*
 local-accounts.txt
 repl-*-preview.png
+.vercel/
+.vercel
+.env*
+
+production-accounts.txt
+vercel-*.png
+!.env.example

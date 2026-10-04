@@ -1,0 +1,11 @@
+.git
+.venv
+data
+.env
+.env.*
+local-accounts.txt
+*.png
+.pytest_cache
+__pycache__
+tests
+AI_SUPPORT_IMPLEMENTATION_PLAN.md
