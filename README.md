@@ -1,4 +1,4 @@
-# Support
+# Repl.io
 
 Локальный интерфейс оператора с реальным AI-анализом. Python 3.12+, FastAPI, SQLite, Jev и DeepSeek.
 

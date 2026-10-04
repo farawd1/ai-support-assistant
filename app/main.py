@@ -215,7 +215,7 @@ async def lifespan(app):
     try: await task
     except asyncio.CancelledError: pass
 
-app=FastAPI(title='Support',lifespan=lifespan)
+app=FastAPI(title='Repl.io',lifespan=lifespan)
 app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 @app.get('/')
 def home(): return FileResponse(ROOT/'static/index.html')
